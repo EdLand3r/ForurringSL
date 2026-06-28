@@ -6,6 +6,9 @@ import numpy as np
 from scipy.signal import wiener
 from skimage import restoration
 import math
+import os
+import urllib.request
+import threading
 
 # Configuración de apariencia
 ctk.set_appearance_mode("Dark")
@@ -15,8 +18,8 @@ class ForensicDeblurApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         
-        self.title("Forensic Image Restorer - Avanzado (Zoom & ROI)")
-        self.geometry("1100x750")
+        self.title("Forensic Image Restorer - Avanzado (IA + Zoom)")
+        self.geometry("1200x750")
         
         self.cv_img_original = None
         self.cv_img_processed = None
@@ -28,14 +31,14 @@ class ForensicDeblurApp(ctk.CTk):
         self.pan_y = 0
         self.pan_start_x = 0
         self.pan_start_y = 0
-        self.roi = None # (x1, y1, x2, y2) en coordenadas de la imagen original
-        self.roi_start = None # (x, y) en coordenadas del canvas
+        self.roi = None 
+        self.roi_start = None 
         
         self.setup_ui()
         
     def setup_ui(self):
         # --- Panel Lateral de Controles ---
-        self.sidebar = ctk.CTkFrame(self, width=300, corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=320, corner_radius=0)
         self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
         
         # Botones superiores
@@ -45,29 +48,51 @@ class ForensicDeblurApp(ctk.CTk):
         self.btn_clear_roi = ctk.CTkButton(self.sidebar, text="Limpiar Selección (ROI)", command=self.clear_roi, fg_color="#7a2b2b", hover_color="#9c3b3b")
         self.btn_clear_roi.pack(pady=5, padx=15)
         
-        # Controles de Algoritmo
-        self.label_section = ctk.CTkLabel(self.sidebar, text="Algoritmo", font=ctk.CTkFont(weight="bold"))
+        # TABS
+        self.tabview = ctk.CTkTabview(self.sidebar)
+        self.tabview.pack(padx=10, pady=10, fill="both", expand=True)
+        
+        self.tab_deblur = self.tabview.add("Filtros Clásicos")
+        self.tab_ai = self.tabview.add("Post-Procesamiento IA")
+        
+        # --- TAB: DEBLURRING ---
+        self.label_section = ctk.CTkLabel(self.tab_deblur, text="Algoritmo de Deblurring", font=ctk.CTkFont(weight="bold"))
         self.label_section.pack(pady=(15, 5))
         
         self.algorithm_var = ctk.StringVar(value="Wiener Espacial (Ligero)")
         self.algorithm_dropdown = ctk.CTkOptionMenu(
-            self.sidebar, 
+            self.tab_deblur, 
             values=["Wiener Espacial (Ligero)", "Wiener No Supervisado", "Richardson-Lucy"], 
             variable=self.algorithm_var, 
             command=self.on_algorithm_change
         )
         self.algorithm_dropdown.pack(pady=5, padx=15)
         
-        # Contenedor para controles dinámicos
-        self.dynamic_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.dynamic_frame = ctk.CTkFrame(self.tab_deblur, fg_color="transparent")
         self.dynamic_frame.pack(fill="x", pady=10)
         
-        self.btn_apply = ctk.CTkButton(self.sidebar, text="Aplicar Algoritmo", command=self.apply_heavy_algorithm)
+        self.btn_apply = ctk.CTkButton(self.tab_deblur, text="Aplicar Algoritmo", command=self.apply_heavy_algorithm)
         
-        # Instrucciones de uso
+        # --- TAB: IA ---
+        self.label_ai = ctk.CTkLabel(self.tab_ai, text="Super Resolución (LapSRN)", font=ctk.CTkFont(weight="bold"))
+        self.label_ai.pack(pady=(15, 5))
+        
+        self.label_ai_info = ctk.CTkLabel(self.tab_ai, text="Si hay un ROI, se recortará\nla imagen a esa zona.", text_color="gray")
+        self.label_ai_info.pack(pady=5)
+        
+        self.btn_ai_x4 = ctk.CTkButton(self.tab_ai, text="Mejorar (x4)", command=lambda: self.apply_ai(4))
+        self.btn_ai_x4.pack(pady=10, padx=15)
+        
+        self.btn_ai_x8 = ctk.CTkButton(self.tab_ai, text="Mejorar (x8)", command=lambda: self.apply_ai(8))
+        self.btn_ai_x8.pack(pady=10, padx=15)
+        
+        self.label_ai_status = ctk.CTkLabel(self.tab_ai, text="", text_color="green")
+        self.label_ai_status.pack(pady=10)
+        
+        # Instrucciones de uso compartidas
         self.label_instructions = ctk.CTkLabel(
             self.sidebar, 
-            text="Controles:\n- Rueda Ratón: Zoom\n- Clic Derecho + Arrastrar: Mover\n- Clic Izquierdo + Arrastrar: Seleccionar Área",
+            text="Controles:\n- Rueda: Zoom\n- Clic Der: Mover\n- Clic Izq: ROI",
             text_color="gray",
             justify="left"
         )
@@ -80,24 +105,16 @@ class ForensicDeblurApp(ctk.CTk):
         self.canvas = ctk.CTkCanvas(self.preview_frame, bg="#2b2b2b", highlightthickness=0)
         self.canvas.pack(expand=True, fill="both")
         
-        # Eventos del ratón en el Canvas
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)
-        
-        # Paneo (Mover la imagen)
         self.canvas.bind("<ButtonPress-3>", self.start_pan)
         self.canvas.bind("<B3-Motion>", self.do_pan)
         self.canvas.bind("<ButtonPress-2>", self.start_pan)
         self.canvas.bind("<B2-Motion>", self.do_pan)
-        
-        # ROI (Seleccionar área)
         self.canvas.bind("<ButtonPress-1>", self.start_roi)
         self.canvas.bind("<B1-Motion>", self.do_roi)
         self.canvas.bind("<ButtonRelease-1>", self.end_roi)
-        
-        # Asegurar redibujado si se cambia el tamaño de la ventana
         self.canvas.bind("<Configure>", lambda e: self.redraw_canvas())
         
-        # Inicializar controles
         self.on_algorithm_change("Wiener Espacial (Ligero)")
 
     def clear_roi(self):
@@ -192,27 +209,16 @@ class ForensicDeblurApp(ctk.CTk):
     
     def on_mouse_wheel(self, event):
         if self.cv_img_original is None: return
-        
-        # Coordenadas relativas al canvas
-        x = event.x
-        y = event.y
-        
-        # Coordenadas en la imagen antes del zoom
+        x, y = event.x, event.y
         ix = (x - self.pan_x) / self.zoom_factor
         iy = (y - self.pan_y) / self.zoom_factor
         
-        if event.delta > 0:
-            self.zoom_factor *= 1.2
-        else:
-            self.zoom_factor /= 1.2
+        if event.delta > 0: self.zoom_factor *= 1.2
+        else: self.zoom_factor /= 1.2
             
-        # Limitar el alejamiento excesivo
         self.zoom_factor = max(0.1, min(self.zoom_factor, 20.0))
-            
-        # Ajustar el paneo para que el zoom sea hacia el puntero
         self.pan_x = x - ix * self.zoom_factor
         self.pan_y = y - iy * self.zoom_factor
-        
         self.redraw_canvas()
 
     def start_pan(self, event):
@@ -234,7 +240,7 @@ class ForensicDeblurApp(ctk.CTk):
         self.roi = None
         self.cv_img_processed = None
         self.canvas.delete("roi_rect")
-        self.redraw_canvas() # Limpia procesamientos previos si se inicia un nuevo ROI
+        self.redraw_canvas() 
 
     def do_roi(self, event):
         if self.cv_img_original is None or not self.roi_start: return
@@ -256,7 +262,6 @@ class ForensicDeblurApp(ctk.CTk):
         if x2 - x1 < 10 or y2 - y1 < 10:
             self.roi = None
         else:
-            # Convertir de coordenadas del canvas a coordenadas de la imagen
             ix1 = int((x1 - self.pan_x) / self.zoom_factor)
             ix2 = int((x2 - self.pan_x) / self.zoom_factor)
             iy1 = int((y1 - self.pan_y) / self.zoom_factor)
@@ -277,11 +282,9 @@ class ForensicDeblurApp(ctk.CTk):
 
     def redraw_canvas(self):
         if self.cv_img_original is None: return
-        
         self.canvas.delete("all")
         
         img_to_draw = self.cv_img_processed if self.cv_img_processed is not None else self.cv_img_original
-        
         h, w = img_to_draw.shape[:2]
         new_w = int(w * self.zoom_factor)
         new_h = int(h * self.zoom_factor)
@@ -291,14 +294,12 @@ class ForensicDeblurApp(ctk.CTk):
         img_rgb = cv2.cvtColor(img_to_draw, cv2.COLOR_BGR2RGB)
         pil_img = Image.fromarray(img_rgb)
         
-        # Redimensionado eficiente: Nearest para gran zoom para ver píxeles, Bilinear para alejamiento
         resample_filter = Image.Resampling.NEAREST if self.zoom_factor > 2.0 else Image.Resampling.BILINEAR
         pil_img = pil_img.resize((new_w, new_h), resample_filter)
         
         self.tk_img = ImageTk.PhotoImage(pil_img)
         self.canvas.create_image(self.pan_x, self.pan_y, anchor="nw", image=self.tk_img)
         
-        # Dibujar ROI si existe
         if self.roi:
             x1, y1, x2, y2 = self.roi
             cx1 = x1 * self.zoom_factor + self.pan_x
@@ -307,14 +308,83 @@ class ForensicDeblurApp(ctk.CTk):
             cy2 = y2 * self.zoom_factor + self.pan_y
             self.canvas.create_rectangle(cx1, cy1, cx2, cy2, outline="#00ffcc", width=2, dash=(4, 4), tags="roi_rect")
 
-    # --- Procesamiento de Imágenes ---
+    # --- Lógica de IA ---
+    def download_model(self, scale):
+        model_name = f"LapSRN_x{scale}.pb"
+        url = f"https://raw.githubusercontent.com/fannymonori/TF-LapSRN/master/export/{model_name}"
+        if not os.path.exists(model_name):
+            self.label_ai_status.configure(text=f"Descargando {model_name}...", text_color="orange")
+            self.update()
+            try:
+                urllib.request.urlretrieve(url, model_name)
+                self.label_ai_status.configure(text="Descarga exitosa.", text_color="green")
+            except Exception as e:
+                self.label_ai_status.configure(text=f"Error descarga.", text_color="red")
+                print(f"Download Error: {e}")
+                return False
+        return True
 
+    def apply_ai(self, scale):
+        if self.cv_img_original is None: return
+        
+        success = self.download_model(scale)
+        if not success: return
+        
+        # Trabajar sobre el estado actual de la imagen (procesada o no)
+        source = self.cv_img_processed if self.cv_img_processed is not None else self.cv_img_original
+        
+        if self.roi:
+            x1, y1, x2, y2 = self.roi
+            img_crop = source[y1:y2, x1:x2]
+        else:
+            img_crop = source
+            
+        if img_crop.size == 0: return
+
+        self.label_ai_status.configure(text="Procesando IA...", text_color="orange")
+        self.btn_ai_x4.configure(state="disabled")
+        self.btn_ai_x8.configure(state="disabled")
+        self.update()
+        
+        try:
+            sr = cv2.dnn_superres.DnnSuperResImpl_create()
+            sr.readModel(f"LapSRN_x{scale}.pb")
+            sr.setModel("lapsrn", scale)
+            result = sr.upsample(img_crop)
+            
+            # La IA devuelve una imagen de diferente resolución. 
+            # Se recorta el lienzo al área procesada.
+            self.cv_img_original = result
+            self.cv_img_processed = None
+            self.roi = None
+            
+            # Reset vista
+            self.zoom_factor = 1.0
+            self.canvas.update()
+            cw, ch = self.canvas.winfo_width(), self.canvas.winfo_height()
+            h, w = result.shape[:2]
+            scale_w = cw / w
+            scale_h = ch / h
+            self.zoom_factor = min(scale_w, scale_h) * 0.9 if min(scale_w, scale_h) < 1 else 1.0
+            self.pan_x = (cw - (w * self.zoom_factor)) / 2
+            self.pan_y = (ch - (h * self.zoom_factor)) / 2
+            
+            self.label_ai_status.configure(text="¡Imagen Mejorada!", text_color="green")
+            self.redraw_canvas()
+        except Exception as e:
+            self.label_ai_status.configure(text="Error de IA", text_color="red")
+            print(f"AI Error: {e}")
+        finally:
+            self.btn_ai_x4.configure(state="normal")
+            self.btn_ai_x8.configure(state="normal")
+
+
+    # --- Procesamiento Clásico ---
     def load_image(self):
         file_path = filedialog.askopenfilename(filetypes=[("Imágenes", "*.jpg *.jpeg *.png *.bmp")])
         if file_path:
             self.cv_img_original = cv2.imread(file_path)
             
-            # Ahora que tenemos ROI y Zoom, podemos permitir imágenes más grandes. Limitamos a 2000px por seguridad de RAM.
             max_dim = 2000
             h, w = self.cv_img_original.shape[:2]
             if max(h, w) > max_dim:
@@ -323,19 +393,16 @@ class ForensicDeblurApp(ctk.CTk):
                 
             self.cv_img_processed = None
             self.roi = None
+            self.label_ai_status.configure(text="")
             
-            # Resetear vista al centro
             self.zoom_factor = 1.0
             self.canvas.update()
             cw = self.canvas.winfo_width()
             ch = self.canvas.winfo_height()
-            
             h, w = self.cv_img_original.shape[:2]
-            # Ajustar zoom para que la imagen quepa inicialmente
             scale_w = cw / w
             scale_h = ch / h
             self.zoom_factor = min(scale_w, scale_h) * 0.9 if min(scale_w, scale_h) < 1 else 1.0
-            
             self.pan_x = (cw - (w * self.zoom_factor)) / 2
             self.pan_y = (ch - (h * self.zoom_factor)) / 2
             
